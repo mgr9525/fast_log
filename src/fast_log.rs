@@ -49,12 +49,26 @@ impl Logger {
             now: SystemTime::now(),
             formated: log,
         };
-        if let Some(send) = logger().send.get() {
+        if let Some(send) = self.send.get() {
             send.send(fast_log_record)
         } else {
             // Ok(())
             Err(crossbeam_channel::SendError(fast_log_record))
         }
+    }
+    pub fn prints(&self, rcd: FastLogRecord) -> Result<(), SendError<FastLogRecord>> {
+        // if let Some(filter) = self.cfg.get() {
+        if let Some(send) = self.send.get() {
+            /* for filter in filter.filters.iter() {
+                if !filter.do_log(record) {
+                    return;
+                }
+            } */
+            send.send(rcd)
+        } else {
+            Err(crossbeam_channel::SendError(rcd))
+        }
+        // }
     }
 
     pub fn wait(&self) {
@@ -67,8 +81,8 @@ impl Log for Logger {
         metadata.level() <= self.get_level()
     }
     fn log(&self, record: &Record) {
-        if let Some(filter) = logger().cfg.get() {
-            if let Some(send) = logger().send.get() {
+        if let Some(filter) = self.cfg.get() {
+            if let Some(send) = self.send.get() {
                 for filter in filter.filters.iter() {
                     if !filter.do_log(record) {
                         return;
@@ -225,6 +239,135 @@ pub fn init(config: Config) -> Result<&'static Logger, LogError> {
         });
     }
     return Ok(logger());
+}
+pub fn create<F: Fn() -> &'static Logger>(config: Config, logfn: F) -> Result<(), LogError>
+where
+    F: Send + Sync + Copy + 'static,
+{
+    if config.appends.is_empty() {
+        return Err(LogError::from("[fast_log] appends can not be empty!"));
+    }
+    // let mut rtlog = Logger::default();
+    let (s, r) = chan(config.chan_len);
+    logfn()
+        .send
+        .set(s)
+        .map_err(|_| LogError::from("set fail"))?;
+    logfn()
+        .recv
+        .set(r)
+        .map_err(|_| LogError::from("set fail"))?;
+    logfn().set_level(config.level);
+    logfn()
+        .cfg
+        .set(config)
+        .map_err(|_| LogError::from("set fail="))?;
+    //main recv data
+
+    let mut receiver_vec = vec![];
+    let mut sender_vec: Vec<Sender<Arc<Vec<FastLogRecord>>>> = vec![];
+    let cfg = logfn().cfg.get().expect("logger cfg is none");
+    for a in cfg.appends.iter() {
+        let (s, r) = chan(cfg.chan_len);
+        sender_vec.push(s);
+        receiver_vec.push((r, a));
+    }
+    for (receiver, appender) in receiver_vec {
+        spawn(move || {
+            let mut exit = false;
+            loop {
+                let mut remain = vec![];
+                if receiver.len() == 0 {
+                    if let Ok(msg) = receiver.recv() {
+                        remain.push(msg);
+                    }
+                }
+                //recv all
+                loop {
+                    match receiver.try_recv() {
+                        Ok(v) => {
+                            remain.push(v);
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+                //lock get appender
+                let mut shared_appender = appender.lock();
+                for msg in remain {
+                    shared_appender.do_logs(msg.as_ref());
+                    for x in msg.iter() {
+                        match x.command {
+                            Command::CommandRecord => {}
+                            Command::CommandExit => {
+                                exit = true;
+                                continue;
+                            }
+                            Command::CommandFlush(_) => {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if exit {
+                    break;
+                }
+            }
+        });
+    }
+    let sender_vec = Arc::new(sender_vec);
+    for _ in 0..1 {
+        let senders = sender_vec.clone();
+        spawn(move || {
+            loop {
+                if let Some(recv) = logfn().recv.get() {
+                    let mut remain = Vec::with_capacity(recv.len());
+                    //recv
+                    if recv.len() == 0 {
+                        if let Ok(item) = recv.recv() {
+                            remain.push(item);
+                        }
+                    }
+                    //merge log
+                    loop {
+                        match recv.try_recv() {
+                            Ok(v) => {
+                                remain.push(v);
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                    let mut exit = false;
+                    for x in &mut remain {
+                        if x.formated.is_empty() {
+                            logfn()
+                                .cfg
+                                .get()
+                                .expect("logger cfg is none")
+                                .format
+                                .do_format(x);
+                        }
+                        if x.command.eq(&Command::CommandExit) {
+                            exit = true;
+                        }
+                    }
+                    let data = Arc::new(remain);
+                    for x in senders.iter() {
+                        let _ = x.send(data.clone());
+                    }
+                    if exit {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+    Ok(())
 }
 
 pub fn exit() -> Result<(), LogError> {
